@@ -1,10 +1,22 @@
 "use client";
 
 import { parse as parsePartial, Allow } from "partial-json";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BriefingCard } from "@/components/BriefingCard";
-import { FlagsList } from "@/components/FlagsList";
-import { TriageList } from "@/components/TriageList";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Briefing } from "@/components/Briefing";
+import { ControlsPanel, type SnoozeRules } from "@/components/ControlsPanel";
+import { ErrorCard } from "@/components/ErrorCard";
+import { FlagsPanel } from "@/components/FlagsPanel";
+import { Hero } from "@/components/Hero";
+import { MobileApp } from "@/components/MobileApp";
+import { TopBar, type DateLine, type DeviceMode } from "@/components/TopBar";
+import { TriagePanel } from "@/components/TriagePanel";
+import { classifyError, type ClassifiedError } from "@/lib/error-classify";
 import type {
   ChiefOfStaffOutput,
   Flag,
@@ -16,25 +28,41 @@ import type {
 
 type Status = "idle" | "loading" | "processing" | "error";
 
-interface SnoozeRules {
-  hideNewsletters: boolean;
-  hidePersonal: boolean;
+/* ───────────── theme + accent ───────────── */
+
+const ACCENTS = {
+  indigo: { name: "Indigo", light: "oklch(0.55 0.18 264)", dark: "oklch(0.72 0.16 264)" },
+  forest: { name: "Forest", light: "oklch(0.50 0.13 155)", dark: "oklch(0.72 0.13 155)" },
+  ember: { name: "Ember", light: "oklch(0.58 0.17 35)", dark: "oklch(0.76 0.15 35)" },
+  rose: { name: "Rose", light: "oklch(0.58 0.18 0)", dark: "oklch(0.76 0.16 0)" },
+  slate: { name: "Graphite", light: "oklch(0.38 0.020 260)", dark: "oklch(0.78 0.010 260)" },
+} as const;
+type AccentKey = keyof typeof ACCENTS;
+const ACCENT_KEYS = Object.keys(ACCENTS) as AccentKey[];
+
+/* ───────────── snooze filters ───────────── */
+
+function isNewsletter(m: IncomingMessage): boolean {
+  if (m.channel !== "email") return false;
+  const senderAuto = /noreply|no-reply|newsletter|digest|notifications?@/i.test(
+    m.from
+  );
+  const hasUnsub = /unsubscribe/i.test(m.body);
+  return senderAuto && hasUnsub;
+}
+function isPersonal(m: IncomingMessage): boolean {
+  if (m.channel !== "whatsapp") return false;
+  return !/\(.+\)/.test(m.from);
 }
 
-const DEFAULT_SNOOZE: SnoozeRules = {
-  hideNewsletters: false,
-  hidePersonal: false,
-};
+/* ───────────── inbox helpers ───────────── */
 
 function validateMessages(value: unknown): IncomingMessage[] {
-  if (!Array.isArray(value)) {
-    throw new Error("File must contain a JSON array.");
-  }
+  if (!Array.isArray(value)) throw new Error("File must contain a JSON array.");
   const out: IncomingMessage[] = [];
   value.forEach((raw, idx) => {
-    if (!raw || typeof raw !== "object") {
+    if (!raw || typeof raw !== "object")
       throw new Error(`Entry ${idx} is not an object.`);
-    }
     const v = raw as Record<string, unknown>;
     const missing = ["id", "channel", "from", "timestamp", "body"].filter(
       (k) => !(k in v)
@@ -49,67 +77,53 @@ function validateMessages(value: unknown): IncomingMessage[] {
   return out;
 }
 
-function isNewsletterOrAutomated(m: IncomingMessage): boolean {
-  if (m.channel !== "email") return false;
-  // Require BOTH an automated-looking sender AND an unsubscribe link.
-  // This is what distinguishes a real newsletter from a phishing email
-  // (which often uses noreply@ but never includes an unsubscribe link).
-  const from = m.from.toLowerCase();
-  const senderLooksAutomated =
-    /noreply|no-reply|newsletter|digest|notifications?@/.test(from);
-  const hasUnsubscribe = /unsubscribe/i.test(m.body);
-  return senderLooksAutomated && hasUnsubscribe;
-}
-
-function isPersonal(m: IncomingMessage): boolean {
-  // Heuristic: WhatsApp from someone without a parenthetical work title
-  // (e.g. "James (COO)" → work, "Mum" → personal).
-  if (m.channel !== "whatsapp") return false;
-  return !/\(.+\)/.test(m.from);
-}
-
-function applySnooze(
-  messages: IncomingMessage[],
-  rules: SnoozeRules
-): { kept: IncomingMessage[]; hidden: number } {
-  const kept = messages.filter((m) => {
-    if (rules.hideNewsletters && isNewsletterOrAutomated(m)) return false;
-    if (rules.hidePersonal && isPersonal(m)) return false;
-    return true;
-  });
-  return { kept, hidden: messages.length - kept.length };
-}
-
-function channelCounts(messages: IncomingMessage[]) {
-  const c = { email: 0, slack: 0, whatsapp: 0 };
-  for (const m of messages) {
-    if (m.channel in c) c[m.channel] += 1;
-  }
-  return c;
-}
-
-// Pick a "current time" the model can sensibly reason about.
-// If the inbox is fresh (latest message in the last 24h), use the wall clock.
-// If the inbox is older (e.g. the static sample dated months ago, or a
-// historical fixture the reviewer uploaded), use the latest message
-// timestamp + 1 hour. This stops the model from concluding "everything is
-// stale, ignore it all" — which is a real failure mode at temperature > 0.
-function formatCurrentTime(messages: IncomingMessage[]): string {
+function deriveDateline(messages: IncomingMessage[]): DateLine {
+  const ts = messages
+    .map((m) => Date.parse(m.timestamp))
+    .filter((n) => Number.isFinite(n));
+  if (ts.length === 0) return { day: "", time: "" };
+  const max = Math.max(...ts);
   const now = Date.now();
-  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-  let referenceMs = now;
-  if (messages.length > 0) {
-    const latest = Math.max(
-      ...messages.map((m) => {
-        const t = Date.parse(m.timestamp);
-        return Number.isFinite(t) ? t : 0;
-      })
-    );
-    if (latest > 0 && now - latest > ONE_DAY_MS) {
-      referenceMs = latest + 60 * 60 * 1000; // 1h after the latest message
-    }
+  const ref =
+    now - max > 24 * 60 * 60 * 1000 ? new Date(max + 60 * 60 * 1000) : new Date();
+  return {
+    day: ref.toLocaleString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+    }),
+    time: ref.toLocaleString(undefined, { hour: "numeric", minute: "2-digit" }),
+  };
+}
+
+function deriveMobileDateline(messages: IncomingMessage[]) {
+  const ts = messages
+    .map((m) => Date.parse(m.timestamp))
+    .filter((n) => Number.isFinite(n));
+  const max = ts.length ? Math.max(...ts) + 60 * 60 * 1000 : Date.now();
+  const d = new Date(max);
+  return {
+    day: d.toLocaleString(undefined, { weekday: "long" }),
+    long: d.toLocaleString(undefined, {
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+    }),
+    time: d.toLocaleString(undefined, { hour: "numeric", minute: "2-digit" }),
+  };
+}
+
+function formatCurrentTime(messages: IncomingMessage[]): string {
+  const ts = messages
+    .map((m) => Date.parse(m.timestamp))
+    .filter((n) => Number.isFinite(n));
+  const now = Date.now();
+  let refMs = now;
+  if (ts.length > 0) {
+    const latest = Math.max(...ts);
+    if (now - latest > 24 * 60 * 60 * 1000) refMs = latest + 60 * 60 * 1000;
   }
-  return new Date(referenceMs).toLocaleString(undefined, {
+  return new Date(refMs).toLocaleString(undefined, {
     weekday: "long",
     year: "numeric",
     month: "long",
@@ -118,6 +132,8 @@ function formatCurrentTime(messages: IncomingMessage[]): string {
     minute: "2-digit",
   });
 }
+
+/* ───────────── partial JSON sanitisers ───────────── */
 
 function isValidFlag(f: unknown): f is Flag {
   if (!f || typeof f !== "object") return false;
@@ -129,7 +145,6 @@ function isValidFlag(f: unknown): f is Flag {
     Array.isArray(v.related_message_ids)
   );
 }
-
 function isValidTriage(t: unknown): t is TriageItem {
   if (!t || typeof t !== "object") return false;
   const v = t as Record<string, unknown>;
@@ -139,7 +154,6 @@ function isValidTriage(t: unknown): t is TriageItem {
     typeof v.reasoning === "string"
   );
 }
-
 function sanitizePartial(raw: unknown): ChiefOfStaffOutput | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const v = raw as Record<string, unknown>;
@@ -151,33 +165,83 @@ function sanitizePartial(raw: unknown): ChiefOfStaffOutput | null {
   };
 }
 
-const SENSITIVITY_OPTIONS: { value: Sensitivity; label: string; hint: string }[] = [
-  {
-    value: "conservative",
-    label: "Conservative",
-    hint: "Smallest Decide list. Maximize protection.",
-  },
-  {
-    value: "balanced",
-    label: "Balanced",
-    hint: "Default judgment.",
-  },
-  {
-    value: "aggressive",
-    label: "Aggressive",
-    hint: "Surface borderline items for CEO visibility.",
-  },
-];
+/* ───────────── client-side sensitivity reweighting ───────────── */
+
+function reweight(triage: TriageItem[], sensitivity: Sensitivity): TriageItem[] {
+  return triage.map((t) => {
+    if (
+      sensitivity === "conservative" &&
+      t.category === "decide" &&
+      t.confidence === "medium"
+    ) {
+      return {
+        ...t,
+        category: "delegate",
+        assignee: t.assignee || "Laura Singh (EA)",
+      };
+    }
+    if (
+      sensitivity === "aggressive" &&
+      t.category === "delegate" &&
+      t.confidence === "medium"
+    ) {
+      return { ...t, category: "decide" };
+    }
+    return t;
+  });
+}
+
+/* ───────────── main page ───────────── */
 
 export default function HomePage() {
   const [messages, setMessages] = useState<IncomingMessage[]>([]);
   const [output, setOutput] = useState<ChiefOfStaffOutput | null>(null);
   const [status, setStatus] = useState<Status>("loading");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [sourceLabel, setSourceLabel] = useState<string>("Sample inbox");
+  const classifiedError: ClassifiedError | null = useMemo(
+    () => (errorMsg ? classifyError(errorMsg) : null),
+    [errorMsg]
+  );
+
   const [sensitivity, setSensitivity] = useState<Sensitivity>("balanced");
-  const [snooze, setSnooze] = useState<SnoozeRules>(DEFAULT_SNOOZE);
+  const [snooze, setSnooze] = useState<SnoozeRules>({
+    hideNewsletters: false,
+    hidePersonal: false,
+  });
+
+  const [dark, setDark] = useState(false);
+  const [accent, setAccent] = useState<AccentKey>("indigo");
+
+  const [device, setDevice] = useState<DeviceMode>("desktop");
+  const [viewportNarrow, setViewportNarrow] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Track viewport size for "auto" mode.
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 768px)");
+    const update = () => setViewportNarrow(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+
+  // Apply theme + accent.
+  useEffect(() => {
+    const html = document.documentElement;
+    html.dataset.theme = dark ? "dark" : "light";
+    const a = ACCENTS[accent];
+    const color = dark ? a.dark : a.light;
+    html.style.setProperty("--accent", color);
+    html.style.setProperty(
+      "--accent-soft",
+      `color-mix(in oklab, ${color} 12%, transparent)`
+    );
+    html.style.setProperty(
+      "--accent-fg",
+      dark ? "oklch(0.15 0.012 260)" : "oklch(0.99 0 0)"
+    );
+  }, [dark, accent]);
 
   // Load sample on first paint.
   useEffect(() => {
@@ -202,14 +266,86 @@ export default function HomePage() {
     };
   }, []);
 
-  const counts = useMemo(() => channelCounts(messages), [messages]);
-  const filteredView = useMemo(
-    () => applySnooze(messages, snooze),
-    [messages, snooze]
+  /* ───── filtering ───── */
+  const filtered = useMemo(() => {
+    const kept = messages.filter((m) => {
+      if (snooze.hideNewsletters && isNewsletter(m)) return false;
+      if (snooze.hidePersonal && isPersonal(m)) return false;
+      return true;
+    });
+    return { kept, hidden: messages.length - kept.length };
+  }, [messages, snooze]);
+
+  const visibleTriage = useMemo(() => {
+    if (!output) return [] as TriageItem[];
+    const ids = new Set(filtered.kept.map((m) => m.id));
+    return output.triage.filter((t) => ids.has(t.message_id));
+  }, [output, filtered.kept]);
+
+  const reweighted = useMemo(
+    () => reweight(visibleTriage, sensitivity),
+    [visibleTriage, sensitivity]
   );
 
+  const counts = useMemo(
+    () => ({
+      decide: reweighted.filter((t) => t.category === "decide").length,
+      delegate: reweighted.filter((t) => t.category === "delegate").length,
+      ignore: reweighted.filter((t) => t.category === "ignore").length,
+    }),
+    [reweighted]
+  );
+
+  const hiddenBreakdown = useMemo(
+    () => ({
+      newsletters: messages.filter(isNewsletter).length,
+      personal: messages.filter(isPersonal).length,
+    }),
+    [messages]
+  );
+
+  const visibleFlags = useMemo(() => {
+    if (!output) return [] as Flag[];
+    const keptIds = new Set(filtered.kept.map((m) => m.id));
+    return output.flags.filter(
+      (f) =>
+        f.related_message_ids.length === 0 ||
+        f.related_message_ids.some((id) => keptIds.has(id))
+    );
+  }, [output, filtered.kept]);
+
+  const dateline = useMemo(
+    () => deriveDateline(filtered.kept.length ? filtered.kept : messages),
+    [filtered.kept, messages]
+  );
+  const mobileDateline = useMemo(
+    () => deriveMobileDateline(filtered.kept.length ? filtered.kept : messages),
+    [filtered.kept, messages]
+  );
+
+  /* ───── shared toast (desktop) ───── */
+  const [toast, setToast] = useState("");
+  const [highlight, setHighlight] = useState<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const showToast = useCallback((text: string) => {
+    setToast(text);
+    if (toastTimerRef.current != null)
+      window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(""), 1700);
+  }, []);
+
+  const onRefClick = useCallback((id: number) => {
+    setHighlight(id);
+    window.setTimeout(() => {
+      const el = document.getElementById(`msg-${id}`);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 60);
+    window.setTimeout(() => setHighlight(null), 2200);
+  }, []);
+
+  /* ───── processing ───── */
   const onProcess = useCallback(async () => {
-    if (filteredView.kept.length === 0) return;
+    if (filtered.kept.length === 0) return;
     setStatus("processing");
     setErrorMsg(null);
     setOutput(null);
@@ -219,9 +355,9 @@ export default function HomePage() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          messages: filteredView.kept,
-          sensitivity,
-          current_time: formatCurrentTime(filteredView.kept),
+          messages: filtered.kept,
+          current_time: formatCurrentTime(filtered.kept),
+          sensitivity: "balanced",
         }),
       });
       if (!res.ok) {
@@ -236,28 +372,37 @@ export default function HomePage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      // Throttle partial-JSON parses and React re-renders during streaming.
+      // Gemini emits many small chunks; without throttling we'd parse a
+      // growing buffer hundreds of times and re-render the whole page each
+      // time, which makes the UI feel laggy. 120ms is the sweet spot.
+      let lastUpdate = 0;
+      const UPDATE_INTERVAL_MS = 120;
+
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Did the server inject an error sentinel mid-stream?
         const errMatch = buffer.match(
           /__STREAM_ERROR__([\s\S]*?)__STREAM_ERROR__/
         );
         if (errMatch) throw new Error(errMatch[1]);
 
-        // Best-effort progressive render.
+        const now =
+          typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (now - lastUpdate < UPDATE_INTERVAL_MS) continue;
+        lastUpdate = now;
+
         try {
           const partial = parsePartial(buffer, Allow.ALL);
           const cleaned = sanitizePartial(partial);
           if (cleaned) setOutput(cleaned);
         } catch {
-          // ignore; will succeed on a later chunk
+          // try again next chunk
         }
       }
 
-      // Final, strict parse.
       let final: ChiefOfStaffOutput;
       try {
         const parsed = JSON.parse(buffer);
@@ -272,15 +417,16 @@ export default function HomePage() {
       }
       setOutput(final);
       setStatus("idle");
+      showToast("Briefing ready");
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Processing failed.");
       setOutput(null);
     }
-  }, [filteredView.kept, sensitivity]);
+  }, [filtered.kept, showToast]);
 
+  /* ───── upload / reset ───── */
   const onUploadClick = () => fileInputRef.current?.click();
-
   const onFileChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = "";
@@ -290,221 +436,182 @@ export default function HomePage() {
       const parsed = validateMessages(JSON.parse(text));
       setMessages(parsed);
       setOutput(null);
-      setSourceLabel(file.name);
       setStatus("idle");
       setErrorMsg(null);
+      showToast(`Loaded ${parsed.length} messages from ${file.name}`);
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Invalid JSON file.");
     }
   };
-
   const onResetSample = async () => {
     setStatus("loading");
     setErrorMsg(null);
     setOutput(null);
-    setSourceLabel("Sample inbox");
     try {
       const res = await fetch("/messages.json", { cache: "no-store" });
       const json = await res.json();
       setMessages(validateMessages(json));
       setStatus("idle");
+      showToast("Reset to sample inbox");
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Failed to load sample.");
     }
   };
 
-  const busy = status === "loading" || status === "processing";
-  const hiddenCount = filteredView.hidden;
+  const onCycleAccent = () => {
+    const i = ACCENT_KEYS.indexOf(accent);
+    setAccent(ACCENT_KEYS[(i + 1) % ACCENT_KEYS.length]);
+  };
+
+  const processing = status === "processing";
+  const hasOutput = output != null && output.triage.length > 0;
+  const ready = filtered.kept.length > 0 && status !== "loading";
+
+  // Effective layout: "auto" picks based on viewport width.
+  const effective: "desktop" | "mobile" =
+    device === "auto" ? (viewportNarrow ? "mobile" : "desktop") : device;
+  const showFrame = device === "mobile"; // bare layout only in "auto" mode on a narrow viewport
+
+  /* ───── render ───── */
 
   return (
-    <main className="mx-auto w-full max-w-5xl px-4 py-10 sm:px-6 sm:py-14">
-      <header className="mb-8">
-        <div className="mb-1 text-xs font-semibold uppercase tracking-[0.18em] text-ink-500">
-          AI Chief of Staff
-        </div>
-        <h1 className="text-3xl font-semibold tracking-tight text-ink-900 sm:text-4xl">
-          Your morning, triaged.
-        </h1>
-        <p className="mt-2 max-w-2xl text-ink-600">
-          Every email, Slack message, and WhatsApp from the morning &mdash; read
-          together, cross-referenced, and reduced to what actually needs you.
-        </p>
-      </header>
+    <div className="shell">
+      <TopBar
+        dateline={dateline}
+        dark={dark}
+        onToggleDark={() => setDark((v) => !v)}
+        onCycleAccent={onCycleAccent}
+        onProcess={onProcess}
+        onUpload={onUploadClick}
+        onReset={onResetSample}
+        processing={processing}
+        hasData={hasOutput}
+        ready={ready}
+        device={device}
+        setDevice={setDevice}
+        compact={effective === "mobile"}
+      />
 
-      <section className="mb-8 rounded-2xl border border-ink-200 bg-white p-5 shadow-card sm:p-6">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <div className="text-sm font-semibold text-ink-900">
-              {sourceLabel}
-            </div>
-            <div className="mt-1 text-sm text-ink-500">
-              {messages.length} messages &middot; {counts.email} email &middot;{" "}
-              {counts.slack} Slack &middot; {counts.whatsapp} WhatsApp
-              {hiddenCount > 0 && (
-                <span className="ml-1 text-ink-400">
-                  &middot; {hiddenCount} hidden by filters
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={onProcess}
-              disabled={busy || filteredView.kept.length === 0}
-              className="inline-flex items-center gap-2 rounded-lg bg-ink-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-ink-800 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {status === "processing" ? (
-                <>
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
-                  Streaming…
-                </>
-              ) : (
-                <>Process inbox</>
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={onUploadClick}
-              disabled={busy}
-              className="rounded-lg border border-ink-300 bg-white px-4 py-2 text-sm font-medium text-ink-800 transition hover:bg-ink-50 disabled:opacity-50"
-            >
-              Upload JSON
-            </button>
-            <button
-              type="button"
-              onClick={onResetSample}
-              disabled={busy}
-              className="rounded-lg border border-transparent px-3 py-2 text-sm font-medium text-ink-500 transition hover:text-ink-900 disabled:opacity-50"
-            >
-              Reset to sample
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="application/json,.json"
-              className="hidden"
-              onChange={onFileChosen}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json,.json"
+        style={{ display: "none" }}
+        onChange={onFileChosen}
+      />
+
+      {effective === "mobile" ? (
+        <div className="mob-stage">
+          <MobileApp
+            messages={messages}
+            output={output}
+            visibleFlags={visibleFlags}
+            counts={counts}
+            hiddenBreakdown={hiddenBreakdown}
+            dateline={mobileDateline}
+            sensitivity={sensitivity}
+            setSensitivity={setSensitivity}
+            snooze={snooze}
+            setSnooze={setSnooze}
+            dark={dark}
+            setDark={setDark}
+            accent={accent}
+            setAccent={setAccent}
+            onProcess={onProcess}
+            onReset={onResetSample}
+            processing={processing}
+            reweighted={reweighted}
+            filteredMessages={filtered.kept}
+            framed={showFrame}
+            error={classifiedError}
+          />
+        </div>
+      ) : (
+        <main className="page">
+          <Hero
+            dateline={dateline}
+            counts={counts}
+            total={filtered.kept.length}
+            flagsCount={visibleFlags.length}
+            hiddenCount={filtered.hidden}
+            hasOutput={hasOutput}
+            onProcess={onProcess}
+            processing={processing}
+          />
+
+          {classifiedError ? (
+            <ErrorCard
+              error={classifiedError}
+              onRetry={onProcess}
+              onDismiss={() => setErrorMsg(null)}
             />
-          </div>
-        </div>
+          ) : null}
 
-        <div className="mt-5 grid gap-4 border-t border-ink-100 pt-5 sm:grid-cols-2">
-          <div>
-            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-              Sensitivity
-            </div>
-            <div className="inline-flex rounded-lg bg-ink-100 p-1">
-              {SENSITIVITY_OPTIONS.map((opt) => {
-                const active = opt.value === sensitivity;
-                return (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    onClick={() => setSensitivity(opt.value)}
-                    title={opt.hint}
-                    className={`rounded-md px-3 py-1 text-xs font-medium transition ${
-                      active
-                        ? "bg-white text-ink-900 shadow-sm"
-                        : "text-ink-600 hover:text-ink-900"
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
-            </div>
-            <p className="mt-1.5 text-xs text-ink-500">
-              {SENSITIVITY_OPTIONS.find((o) => o.value === sensitivity)?.hint}
-            </p>
-          </div>
-          <div>
-            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-              Snooze
-            </div>
-            <div className="flex flex-col gap-2 text-sm text-ink-700">
-              <label className="inline-flex cursor-pointer items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={snooze.hideNewsletters}
-                  onChange={(e) =>
-                    setSnooze((s) => ({
-                      ...s,
-                      hideNewsletters: e.target.checked,
-                    }))
-                  }
-                  className="h-4 w-4 cursor-pointer rounded border-ink-300 text-ink-900 focus:ring-ink-400"
+          <div className="grid">
+            <div className="col-main">
+              {hasOutput && output ? (
+                <section className="card">
+                  <div className="card-head">
+                    <h2>Daily briefing</h2>
+                    <span className="head-meta">
+                      <span>&lt; 2 min read</span>
+                      <span>·</span>
+                      <span>
+                        generated{" "}
+                        {new Date(output.generated_at).toLocaleString(
+                          undefined,
+                          {
+                            hour: "numeric",
+                            minute: "2-digit",
+                          }
+                        )}
+                      </span>
+                    </span>
+                  </div>
+                  <Briefing
+                    markdown={output.briefing}
+                    onRefClick={onRefClick}
+                  />
+                </section>
+              ) : null}
+
+              {hasOutput ? (
+                <TriagePanel
+                  messages={filtered.kept}
+                  triage={reweighted}
+                  highlight={highlight}
+                  onRefClick={onRefClick}
+                  onToast={showToast}
                 />
-                Hide newsletters & automated emails
-              </label>
-              <label className="inline-flex cursor-pointer items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={snooze.hidePersonal}
-                  onChange={(e) =>
-                    setSnooze((s) => ({ ...s, hidePersonal: e.target.checked }))
-                  }
-                  className="h-4 w-4 cursor-pointer rounded border-ink-300 text-ink-900 focus:ring-ink-400"
-                />
-                Hide personal WhatsApps
-              </label>
+              ) : null}
             </div>
-          </div>
-        </div>
 
-        {errorMsg && (
-          <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-            {errorMsg}
+            <aside className="col-side">
+              {hasOutput ? (
+                <FlagsPanel flags={visibleFlags} onRefClick={onRefClick} />
+              ) : null}
+              <ControlsPanel
+                sensitivity={sensitivity}
+                setSensitivity={setSensitivity}
+                snooze={snooze}
+                setSnooze={setSnooze}
+                hiddenBreakdown={hiddenBreakdown}
+              />
+            </aside>
           </div>
-        )}
-      </section>
 
-      {status === "processing" && !output && (
-        <div className="mb-8 rounded-2xl border border-dashed border-ink-300 bg-white p-10 text-center shadow-sm">
-          <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center">
-            <span className="h-3 w-3 animate-ping rounded-full bg-ink-900" />
-          </div>
-          <p className="text-sm text-ink-600">
-            Reading {filteredView.kept.length} messages, cross-referencing
-            threads, and drafting responses…
-          </p>
-        </div>
+          <footer className="foot">
+            Read together, not one by one. Powered by Gemini · designed for calm
+            mornings.
+          </footer>
+        </main>
       )}
 
-      {output && (
-        <div className="grid gap-6">
-          {output.briefing && (
-            <BriefingCard
-              briefing={output.briefing}
-              generatedAt={output.generated_at}
-            />
-          )}
-          <FlagsList flags={output.flags} />
-          <TriageList messages={filteredView.kept} triage={output.triage} />
-        </div>
-      )}
-
-      {!output && status === "idle" && messages.length > 0 && <EmptyState />}
-
-      <footer className="mt-12 text-center text-xs text-ink-400">
-        Built for the Innate AI developer assessment. Powered by Gemini.
-      </footer>
-    </main>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-2xl border border-dashed border-ink-300 bg-white p-10 text-center shadow-sm">
-      <h2 className="text-base font-semibold text-ink-900">
-        Ready when you are.
-      </h2>
-      <p className="mt-2 text-sm text-ink-500">
-        Click <span className="font-medium text-ink-800">Process inbox</span> to
-        triage the morning. The briefing streams in as it generates.
-      </p>
+      <div className="toast" data-show={toast ? "true" : "false"}>
+        {toast}
+      </div>
     </div>
   );
 }

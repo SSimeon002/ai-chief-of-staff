@@ -1,51 +1,40 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import type {
-  Confidence,
-  IncomingMessage,
-  TriageItem,
-} from "@/lib/types";
+import { Fragment, useEffect, useRef, useState } from "react";
+import type { IncomingMessage, TriageItem } from "@/lib/types";
 import { ChannelBadge } from "./ChannelBadge";
-
-const CATEGORY_STYLES: Record<TriageItem["category"], string> = {
-  decide: "bg-red-100 text-red-800 ring-red-200",
-  delegate: "bg-amber-100 text-amber-800 ring-amber-200",
-  ignore: "bg-ink-100 text-ink-700 ring-ink-200",
-};
-
-const CONFIDENCE_STYLES: Record<Confidence, string> = {
-  high: "",
-  medium: "bg-sky-50 text-sky-700 ring-sky-200",
-  low: "bg-yellow-50 text-yellow-800 ring-yellow-300",
-};
-
-const CONFIDENCE_LABELS: Record<Confidence, string> = {
-  high: "",
-  medium: "Medium confidence",
-  low: "Low confidence — check original",
-};
+import { CategoryBadge } from "./CategoryBadge";
+import { Icon } from "./Icon";
 
 function formatTime(iso: string): string {
   try {
     return new Date(iso).toLocaleString(undefined, {
       hour: "numeric",
       minute: "2-digit",
-      month: "short",
-      day: "numeric",
     });
   } catch {
     return iso;
   }
 }
 
-function useAutoSizeTextarea(value: string) {
+function avatarInitials(name: string): string {
+  const cleaned = name
+    .replace(/<[^>]+>/g, "")
+    .replace(/\(.*?\)/g, "")
+    .trim();
+  const tokens = cleaned.split(/[\s.@_-]+/).filter(Boolean);
+  const a = tokens[0]?.[0] || "?";
+  const b = tokens[1]?.[0] || "";
+  return (a + b).toUpperCase();
+}
+
+function useAutoSize(value: string) {
   const ref = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    el.style.height = el.scrollHeight + "px";
   }, [value]);
   return ref;
 }
@@ -53,169 +42,192 @@ function useAutoSizeTextarea(value: string) {
 export function MessageCard({
   message,
   triage,
+  highlight,
+  initiallyOpen,
+  onRefClick,
+  onToast,
 }: {
   message: IncomingMessage;
   triage: TriageItem;
+  highlight?: boolean;
+  initiallyOpen?: boolean;
+  onRefClick?: (id: number) => void;
+  onToast?: (text: string) => void;
 }) {
-  const [showBody, setShowBody] = useState(false);
+  const [open, setOpen] = useState(!!initiallyOpen);
+  const [showOriginal, setShowOriginal] = useState(false);
   const [reply, setReply] = useState(triage.drafted_response);
-  const [copied, setCopied] = useState(false);
-  const textareaRef = useAutoSizeTextarea(reply);
+  const textareaRef = useAutoSize(reply);
 
-  // If the underlying drafted_response changes (e.g. re-processing), reset edits.
   useEffect(() => {
     setReply(triage.drafted_response);
   }, [triage.drafted_response]);
 
-  const superseded = (triage.superseded_by?.length ?? 0) > 0;
-  const confidence: Confidence = triage.confidence ?? "high";
-  const showConfidenceBadge = confidence !== "high";
+  // If the user clicks a [#N] reference, this card should pop open so the
+  // briefing-to-message hop feels continuous.
+  useEffect(() => {
+    if (highlight) setOpen(true);
+  }, [highlight]);
 
-  async function copyReply() {
+  const superseded = (triage.superseded_by?.length ?? 0) > 0;
+  const edited = reply !== triage.drafted_response;
+
+  const copy = async () => {
     if (!reply) return;
     try {
       await navigator.clipboard.writeText(reply);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      onToast?.("Reply copied");
     } catch {
-      // ignore
+      onToast?.("Copy failed");
     }
-  }
+  };
 
-  function resetReply() {
-    setReply(triage.drafted_response);
-  }
-
-  const replyEdited = reply !== triage.drafted_response;
+  const displayFrom = message.from.replace(/<[^>]+>/g, "").trim();
+  const emailAddr = message.from.match(/<([^>]+)>/)?.[1];
 
   return (
     <article
-      className={`rounded-xl border bg-white p-4 shadow-sm transition ${
-        superseded ? "border-ink-200 opacity-70" : "border-ink-200"
-      }`}
+      className="msg"
+      data-superseded={superseded}
+      data-highlight={highlight ? "true" : "false"}
+      id={`msg-${message.id}`}
     >
-      <header className="flex flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="mb-1 flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        className="msg-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span className="msg-id mono">#{message.id}</span>
+        <div className="msg-main">
+          <div className="msg-meta">
             <ChannelBadge channel={message.channel} />
-            <span className="text-xs text-ink-500">#{message.id}</span>
-            <span className="text-xs text-ink-500">
-              {formatTime(message.timestamp)}
+            <span className="sep">·</span>
+            <span className="mono">{formatTime(message.timestamp)}</span>
+            {message.channel_name ? (
+              <>
+                <span className="sep">·</span>
+                <span>{message.channel_name}</span>
+              </>
+            ) : null}
+          </div>
+          <div className="msg-from" title={emailAddr || displayFrom}>
+            {displayFrom}
+          </div>
+          {message.subject ? (
+            <div className="msg-subject">{message.subject}</div>
+          ) : null}
+        </div>
+        <div className="msg-right">
+          <CategoryBadge category={triage.category} />
+          {triage.confidence && triage.confidence !== "high" ? (
+            <span className="conf">
+              <b>{triage.confidence}</b> confidence
             </span>
-          </div>
-          <div className="truncate font-medium text-ink-900">{message.from}</div>
-          {message.subject && (
-            <div className="truncate text-sm text-ink-600">
-              {message.subject}
-            </div>
-          )}
-          {message.channel_name && (
-            <div className="truncate text-sm text-ink-600">
-              {message.channel_name}
-            </div>
-          )}
+          ) : null}
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-1">
-          <span
-            className={`rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider ring-1 ring-inset ${CATEGORY_STYLES[triage.category]}`}
-          >
-            {triage.category}
-          </span>
-          {showConfidenceBadge && (
-            <span
-              title={CONFIDENCE_LABELS[confidence]}
-              className={`rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${CONFIDENCE_STYLES[confidence]}`}
-            >
-              {confidence === "low" ? "Low confidence" : "Medium confidence"}
-            </span>
-          )}
-        </div>
-      </header>
+      </button>
 
-      {superseded && (
-        <div className="mt-3 rounded-md bg-ink-100 px-3 py-1.5 text-xs text-ink-700">
-          Superseded by{" "}
-          {triage.superseded_by!.map((id) => `#${id}`).join(", ")}
-        </div>
-      )}
-
-      <div className="mt-3 space-y-3 text-sm">
-        <button
-          type="button"
-          onClick={() => setShowBody((v) => !v)}
-          className="text-xs font-medium text-ink-500 hover:text-ink-900"
-        >
-          {showBody ? "Hide original" : "Show original"}
-        </button>
-        {showBody && (
-          <pre className="whitespace-pre-wrap rounded-md bg-ink-50 p-3 font-sans text-[13px] text-ink-800">
-            {message.body}
-          </pre>
-        )}
-
-        <div>
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-            Why
-          </div>
-          <p className="mt-0.5 text-ink-800">{triage.reasoning}</p>
-        </div>
-
-        {triage.thread_note && (
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-              Thread context
+      {open ? (
+        <div className="msg-body">
+          {superseded ? (
+            <div className="supersede">
+              Resolved by{" "}
+              {triage.superseded_by!.map((id, i) => (
+                <Fragment key={id}>
+                  {i > 0 ? ", " : null}
+                  <a className="ref" onClick={() => onRefClick?.(id)}>
+                    #{id}
+                  </a>
+                </Fragment>
+              ))}
             </div>
-            <p className="mt-0.5 text-ink-700">{triage.thread_note}</p>
-          </div>
-        )}
+          ) : null}
 
-        {triage.category === "delegate" && triage.assignee && (
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-              Assignee
-            </div>
-            <p className="mt-0.5 font-medium text-ink-900">{triage.assignee}</p>
+          <div className="msg-section">
+            <div className="h">Why</div>
+            <div className="p">{triage.reasoning}</div>
           </div>
-        )}
 
-        {triage.drafted_response && triage.drafted_response.trim().length > 0 && (
-          <div>
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-500">
-                {triage.category === "delegate"
-                  ? "Drafted handoff (editable)"
-                  : "Drafted reply (editable)"}
+          {triage.thread_note ? (
+            <div className="msg-section">
+              <div className="h">Thread context</div>
+              <div className="p" style={{ color: "var(--ink-2)" }}>
+                {triage.thread_note}
               </div>
-              <div className="flex items-center gap-3">
-                {replyEdited && (
+            </div>
+          ) : null}
+
+          {triage.category === "delegate" && triage.assignee ? (
+            <div className="msg-section">
+              <div className="h">Assignee</div>
+              <div>
+                <span className="assignee">
+                  <span className="avatar">
+                    {avatarInitials(triage.assignee)}
+                  </span>
+                  {triage.assignee}
+                </span>
+              </div>
+            </div>
+          ) : null}
+
+          {triage.drafted_response && triage.drafted_response.trim() ? (
+            <div className="draft">
+              <div className="draft-head">
+                <span className="h">
+                  <span className="sparkle">
+                    <Icon.sparkle />
+                  </span>
+                  {triage.category === "delegate"
+                    ? "Drafted handoff"
+                    : "Drafted reply"}
+                  {edited ? (
+                    <span style={{ marginLeft: 6, color: "var(--ink-3)" }}>
+                      · edited
+                    </span>
+                  ) : null}
+                </span>
+                <div className="draft-actions">
+                  {edited ? (
+                    <button
+                      type="button"
+                      className="micro"
+                      onClick={() => setReply(triage.drafted_response)}
+                    >
+                      Reset
+                    </button>
+                  ) : null}
                   <button
                     type="button"
-                    onClick={resetReply}
-                    className="text-[11px] font-medium text-ink-500 hover:text-ink-900"
+                    className="micro primary"
+                    onClick={copy}
                   >
-                    Reset
+                    Copy
                   </button>
-                )}
-                <button
-                  type="button"
-                  onClick={copyReply}
-                  className="text-[11px] font-medium text-ink-500 hover:text-ink-900"
-                >
-                  {copied ? "Copied" : "Copy"}
-                </button>
+                </div>
               </div>
+              <textarea
+                ref={textareaRef}
+                value={reply}
+                onChange={(e) => setReply(e.target.value)}
+                spellCheck
+                rows={3}
+              />
             </div>
-            <textarea
-              ref={textareaRef}
-              value={reply}
-              onChange={(e) => setReply(e.target.value)}
-              spellCheck={true}
-              rows={3}
-              className="mt-1 w-full resize-none rounded-md border border-ink-200 bg-ink-50 p-3 font-sans text-[13px] leading-relaxed text-ink-800 outline-none transition focus:border-ink-400 focus:bg-white focus:ring-2 focus:ring-ink-200"
-            />
-          </div>
-        )}
-      </div>
+          ) : null}
+
+          <button
+            type="button"
+            className="toggle-original"
+            onClick={() => setShowOriginal((v) => !v)}
+          >
+            {showOriginal ? "Hide original" : "Show original"}
+            <Icon.chevron />
+          </button>
+          {showOriginal ? <div className="original">{message.body}</div> : null}
+        </div>
+      ) : null}
     </article>
   );
 }
