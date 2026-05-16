@@ -100,7 +100,7 @@ The briefing follows a fixed structure: "Today at a glance" → "Needs your call
 
 ```
 app/
-  api/process/route.ts   # POST endpoint → calls Claude, returns structured output
+  api/process/route.ts   # POST endpoint → calls Gemini, returns structured output
   layout.tsx
   page.tsx               # Main UI (client component)
   globals.css
