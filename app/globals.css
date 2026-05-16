@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: #f5f7fa;
+  color: #11141a;
+}
+
+body {
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Markdown styling for the briefing card. */
+.prose-brief h2 {
+  @apply mt-6 mb-2 text-sm font-semibold uppercase tracking-wider text-ink-500;
+}
+.prose-brief h2:first-child {
+  @apply mt-0;
+}
+.prose-brief p {
+  @apply my-2 leading-relaxed text-ink-800;
+}
+.prose-brief ul {
+  @apply my-2 list-disc space-y-1 pl-5 text-ink-800;
+}
+.prose-brief ol {
+  @apply my-2 list-decimal space-y-1 pl-5 text-ink-800;
+}
+.prose-brief strong {
+  @apply font-semibold text-ink-900;
+}
+.prose-brief code {
+  @apply rounded bg-ink-100 px-1 py-0.5 font-mono text-[0.85em] text-ink-800;
+}
